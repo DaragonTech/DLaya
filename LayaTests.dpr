@@ -1,7 +1,9 @@
 ﻿program LayaTests;
 
 (* Console test/demo for Laya.pas. Usage:  LayaTests.exe [MODEL_DIR] [BACKEND]
-  Without MODEL_DIR only the model-free checks run. Exit code 0 = all passed. *)
+  Without MODEL_DIR only the model-free checks run. Exit code 0 = all passed.
+  Models in a .tar file and codecs for the weights have a test program of their own,
+  LayaTestsEx. *)
 
 {$IFDEF FPC}{$MODE DELPHIUNICODE}{$CODEPAGE UTF8}{$ENDIF}
 {$APPTYPE CONSOLE}
@@ -70,6 +72,25 @@ begin
       Inc(Mismatches);
 end;
 
+var
+  LoadedHookCalls: Integer;
+
+procedure LoadedHook;
+begin
+  Inc(LoadedHookCalls);
+end;
+
+procedure ExpectChoiceBError(A: TLayaAgent; const DefaultOption: string; const Options: array of string;
+  const Needle: string);
+begin
+  try
+    A.AskChoiceB('x', 'Which?', DefaultOption, Options);
+    Check(False, 'AskChoiceB should raise: ' + Needle);
+  except
+    on E: ELaya do Check(Contains(E.Message, Needle), 'AskChoiceB error "' + E.Message + '" lacks "' + Needle + '"');
+  end;
+end;
+
 procedure ModelTests(const Dir, Backend: string);
 var
   A: TLayaAgent;
@@ -77,8 +98,10 @@ var
   W: array[0..2] of TWorker;
   I, Bad: Integer;
 begin
-  A := TLayaAgent.Create(Dir, '{"backend":"' + Backend + '"}');
+  LoadedHookCalls := 0;
+  A := TLayaAgent.Create(Dir, '{"backend":"' + Backend + '"}', LoadedHook);
   try
+    Check(LoadedHookCalls = 1, 'the library-loaded hook runs once per Create');
     S := A.Info;
     Writeln('info: ', S);
     Check(Contains(S, '"max_len":'), 'info');
@@ -91,6 +114,19 @@ begin
       ['cancel', 'upgrade', 'refund'], 'intent');
     Writeln('choice: ', S);
     Check(Contains(S, '"choice":') and Contains(S, '"cancel":'), 'choice answer');
+
+    (* AskChoiceB is AskChoice with two options, read as a Boolean *)
+    S := A.AskChoice('I want to cancel my subscription.', 'What does the customer want?', ['cancel', 'refund']);
+    Check(A.AskChoiceB('I want to cancel my subscription.', 'What does the customer want?', 'refund',
+      ['cancel', 'refund']) = Contains(S, '"choice":"cancel"'), 'AskChoiceB, first option');
+    S := A.AskChoice('I want to cancel my subscription.', 'What does the customer want?', ['a "quoted" one', 'tab'#9'and'#1'more']);
+    Check(A.AskChoiceB('I want to cancel my subscription.', 'What does the customer want?', 'a "quoted" one',
+      ['a "quoted" one', 'tab'#9'and'#1'more']) = Contains(S, '"choice":"a \"quoted\" one"'), 'AskChoiceB, options that need escaping');
+    Check(Contains(S, '"choice":' + LayaQuote('a "quoted" one')) or Contains(S, '"choice":' + LayaQuote('tab'#9'and'#1'more')),
+      'the library writes an option the way LayaQuote does: ' + S);
+    ExpectChoiceBError(A, 'a', ['a', 'b', 'c'], 'exactly two different options');
+    ExpectChoiceBError(A, 'a', ['a', 'a'], 'exactly two different options');
+    ExpectChoiceBError(A, 'c', ['a', 'b'], 'DefaultOption must be one of the two options');
 
     S := A.AskScore('This is the third time I am writing!!!', 'How angry is the customer?',
       ['calm', 'annoyed', 'furious'], 'anger');
@@ -143,6 +179,7 @@ begin
     ExpectLoadFailure('C:\no\such\model', '{"backend":"tpu"}', 'Unknown backend');
     ExpectLoadFailure('C:\no\such\model', '{"nope":1}', 'Unknown option');
     Check(LayaQuote('a"b\c'#10) = '"a\"b\\c\n"', 'LayaQuote');
+    Check(LayaQuote(#1#31) = '"\u0001\u001f"', 'LayaQuote writes control characters in lowercase hex');
     if ParamCount >= 1 then
     begin
 {$IF Defined(CPUX64) or Defined(CPUX86_64)}

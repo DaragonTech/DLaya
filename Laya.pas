@@ -19,13 +19,31 @@ unit Laya;
   on the same agent. Loading a model takes seconds and gigabytes of memory, so create one agent
   per model and keep it alive.
 
-  Also compiles with Free Pascal ({$MODE DELPHI}) against liblaya.so on Linux. *)
+  Loading: with Delphi 2010 or later on Windows the imports are delay-loaded, so laya.dll is
+  loaded on the first call into it and not when the program starts. If the DLL, one of the DLLs
+  it depends on, or one of its exports is missing, that first call raises ELaya, which you can
+  catch and report; the program still starts. Everywhere else the imports are bound at startup.
+
+  Also compiles with Free Pascal ({$MODE DELPHI}) against liblaya.so on Linux.
+
+  With LibLayaX 1.0.15 or later the model may be one .tar file instead of a folder, and a
+  codec may decode the stored weights while they are read. See LayaCodecSupported and
+  LayaSetCodec below, and the README. *)
 
 {$IFDEF FPC}{$MODE DELPHIUNICODE}{$CODEPAGE UTF8}{$ENDIF}
+
+(* "delayed" is a Delphi-for-Windows directive (Delphi 2010 = CompilerVersion 21 and later);
+   Free Pascal does not have it. The compiler flags it as platform-specific, which is expected
+   here, so that warning is switched off for this unit. *)
+{$IFNDEF FPC}{$IFDEF MSWINDOWS}{$IF CompilerVersion >= 21}
+  {$DEFINE LAYA_DELAYED}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$IFEND}{$ENDIF}{$ENDIF}
 
 interface
 
 uses
+  {$IFDEF FPC}dynlibs,{$ELSE}{$IFDEF MSWINDOWS}Windows,{$ENDIF}{$ENDIF}
   SysUtils;
 
 (* The library exists for 64-bit targets only. A new Delphi project starts with the 32-bit
@@ -58,20 +76,53 @@ type
   (* Called from library threads; must be thread-safe (e.g. use TThread.Queue for UI). *)
   TLayaLogProc = procedure(Level: Integer; Text: PAnsiChar; User: Pointer); cdecl;
 
-(* ---- Raw imports (see laya_c.h for the full contract) ---- *)
-function laya_version: PAnsiChar; cdecl; external LayaLib;
-function laya_api_version: Integer; cdecl; external LayaLib;
-procedure laya_set_log_callback(Fn: TLayaLogProc; User: Pointer; MinLevel: Integer); cdecl; external LayaLib;
-function laya_create(ModelDirUtf8, OptionsJson: PAnsiChar): PLayaAgent; cdecl; external LayaLib;
-function laya_predict(Agent: PLayaAgent; RequestJson: PAnsiChar): PAnsiChar; cdecl; external LayaLib;
-function laya_prepare(Agent: PLayaAgent; RequestJson: PAnsiChar): PAnsiChar; cdecl; external LayaLib;
-function laya_info(Agent: PLayaAgent): PAnsiChar; cdecl; external LayaLib;
-procedure laya_free_string(S: PAnsiChar); cdecl; external LayaLib;
-procedure laya_destroy(Agent: PLayaAgent); cdecl; external LayaLib;
-function laya_last_error: PAnsiChar; cdecl; external LayaLib;
+  (* A codec for the weights (LibLayaX 1.0.15 or later). The library hands it a block of the stored weight
+    file and it must replace the block, in place, with the same block of the plain file.
+      Path      the file on disk the block was read from, as a full UTF-8 path: the weight
+                file itself for a model folder, the .tar file for a model in an archive. A
+                codec that keeps a file of its own beside the model finds the folder from it
+                (UTF8ToString(Path), then ExtractFilePath).
+      FileName  the weight file's name without folders, 'model.safetensors', as UTF-8
+      Offset    position of the first byte of Data, counted from the start of the weight
+                file (not of an archive around it)
+      Data      the block; Size bytes. The decoded block has the same size.
+    Return 0 on success; any other value makes the load fail with that number in the message.
+    It is called on the thread that creates the agent, several times per load, with blocks in
+    any order. Only the weight file is passed to it, whether the model is a folder or a .tar. *)
+  TLayaCodecProc = function(User: Pointer; Path, FileName: PAnsiChar; Offset: UInt64;
+    Data: Pointer; Size: UInt64): Integer; cdecl;
+
+(* ---- Raw imports (see laya_c.h for the full contract) ----
+   Delay-loaded where LAYA_DELAYED is defined (see the top of the unit): the first call to any
+   of these loads the library, and raises ELaya if it or the called export cannot be found. *)
+function laya_version: PAnsiChar; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_api_version: Integer; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+procedure laya_set_log_callback(Fn: TLayaLogProc; User: Pointer; MinLevel: Integer); cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_create(ModelDirUtf8, OptionsJson: PAnsiChar): PLayaAgent; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_predict(Agent: PLayaAgent; RequestJson: PAnsiChar): PAnsiChar; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_prepare(Agent: PLayaAgent; RequestJson: PAnsiChar): PAnsiChar; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_info(Agent: PLayaAgent): PAnsiChar; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+procedure laya_free_string(S: PAnsiChar); cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+procedure laya_destroy(Agent: PLayaAgent); cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
+function laya_last_error: PAnsiChar; cdecl;
+  external LayaLib {$IFDEF LAYA_DELAYED}delayed{$ENDIF};
 
 type
   ELaya = class(Exception);
+
+  (* Optional hook invoked after the native Laya library has been physically loaded,
+     but before the first Laya API call. Useful for code that must inspect/patch imports
+     of laya.dll and its dependencies (for example a VFS IAT hook refresh). *)
+  TLayaLibraryLoadedProc = procedure;
 
   TLayaAgent = class
   private
@@ -81,8 +132,13 @@ type
     (* ModelDir: checkpoint folder (contains rl_agent_config.json), or a model store root plus
       "variant" in Options. Options JSON keys: backend (cpu|cuda|vulkan), variant, precision
       (fp32|fp16|bf16), flash, tensor_core, allow_truncation, threads, device (GPU index or
-      part of its name, e.g. "RTX"; default = first discrete GPU). Raises ELaya on failure. *)
-    constructor Create(const ModelDir: string; const OptionsJson: string = '');
+      part of its name, e.g. "RTX"; default = first discrete GPU). Raises ELaya on failure.
+      With LibLayaX 1.0.15 or later, ModelDir may also be the path of an uncompressed .tar
+      file that holds the model. *)
+    constructor Create(const ModelDir: string; const OptionsJson: string = ''); overload;
+    (* The same, calling AOnLibraryLoaded first (see TLayaLibraryLoadedProc). nil is allowed. *)
+    constructor Create(const ModelDir, OptionsJson: string;
+      AOnLibraryLoaded: TLayaLibraryLoadedProc); overload;
     destructor Destroy; override;
 
     (* Request: one request object or an array of them. Returns the full response JSON:
@@ -101,6 +157,12 @@ type
       const Id: string = 'q'): string;
     function AskScore(const State, Instructions: string; const Levels: array of string;
       const Id: string = 'q'): string;
+    (* A choice between exactly two options, as a Boolean: True if the model picked Options[0],
+      False if it picked Options[1]. If the response names neither, DefaultOption decides: it
+      must be one of the two options. Raises ELaya if the arguments are wrong (not two different
+      options, or DefaultOption is not one of them) or the library reports an error. *)
+    function AskChoiceB(const State, Instructions, DefaultOption: string;
+      const Options: array of string; const Id: string = 'q'): Boolean;
 
     property Handle: PLayaAgent read FHandle;
   end;
@@ -109,7 +171,64 @@ type
 function LayaQuote(const S: string): string;
 function LayaVersion: string;
 
+(* True when the loaded library accepts a model in a .tar file and codecs for the weights:
+  LibLayaX 1.0.15 or later. Older libraries have neither. *)
+function LayaCodecSupported: Boolean;
+
+(* Sets the codec for every agent created afterwards; nil removes it. Raises ELaya when the
+  library has no codec support (check LayaCodecSupported first).
+  Both functions need the library in the process and load it when it is not there yet. With a
+  TLayaLibraryLoadedProc hook, note that LayaSetCodec is a call into the library that comes
+  before the hook of the agent you create afterwards; it only stores the two pointers. *)
+procedure LayaSetCodec(Fn: TLayaCodecProc; User: Pointer = nil);
+
 implementation
+
+{$IFDEF LAYA_DELAYED}
+(* Delay-load failures. Left to itself the RTL reports these with a generic exception that
+   does not say what is missing. This hook turns a failure to load laya.dll, or to find one of its exports, into ELaya with a
+   message that names the cause. The hook is process-wide, so failures of other delay-loaded
+   DLLs are passed on to whichever hook was installed before this one. *)
+var
+  PrevDelayHook: TDelayedLoadHook = nil;
+
+function LayaDelayFailure(dliNotify: dliNotification; pdli: PDelayLoadInfo): Pointer; stdcall;
+var
+  ProcName: string;
+begin
+  if (pdli <> nil) and (pdli.szDll <> nil) and
+    SameText(string(AnsiString(pdli.szDll)), LayaLib) then
+    case dliNotify of
+      dliFailLoadLibrary:
+        raise ELaya.CreateFmt(
+          'Cannot load %s (Windows error %d: %s). Put %s and the DLLs it depends on next to the program.',
+          [LayaLib, pdli.dwLastError, Trim(SysErrorMessage(pdli.dwLastError)), LayaLib]);
+      dliFailGetProcAddress:
+        begin
+          if pdli.dlp.fImportByName then
+            ProcName := string(AnsiString(pdli.dlp.szProcName))
+          else
+            ProcName := '#' + IntToStr(pdli.dlp.dwOrdinal);
+          raise ELaya.CreateFmt(
+            '%s does not export %s. It is probably an older build than this unit expects.',
+            [LayaLib, ProcName]);
+        end;
+    end;
+  if Assigned(PrevDelayHook) then
+    Result := PrevDelayHook(dliNotify, pdli)
+  else
+    Result := nil;   (* nil = let the RTL raise its default exception *)
+end;
+
+procedure RemoveDelayHook;
+var
+  Current: TDelayedLoadHook;
+begin
+  Current := SetDliFailureHook2(PrevDelayHook);
+  (* Someone installed a hook after ours: put theirs back. *)
+  if @Current <> @LayaDelayFailure then SetDliFailureHook2(Current);
+end;
+{$ENDIF}
 
 function FromUtf8(P: PAnsiChar): string;
 begin
@@ -119,6 +238,54 @@ end;
 function LayaVersion: string;
 begin
   Result := FromUtf8(laya_version);
+end;
+
+(* laya_set_codec is looked up at run time and not imported: most libraries do not export it.
+  The lookup needs the library in the process; where the imports are delay-loaded and nothing
+  has called into the library yet, it is loaded here and stays loaded. *)
+type
+  TLayaSetCodec = procedure(Fn: TLayaCodecProc; User: Pointer); cdecl;
+
+(* The address of laya_set_codec, or nil. A plain pointer on purpose: with a result of a
+  procedural type, Delphi reads "FindSetCodec" as the function itself and not as a call. *)
+function FindSetCodec: Pointer;
+{$IFDEF FPC}
+var
+  Lib: TLibHandle;
+begin
+  Result := nil;
+  Lib := LoadLibrary(LayaLib);
+  if Lib <> NilHandle then
+    Result := GetProcedureAddress(Lib, 'laya_set_codec');
+end;
+{$ELSE}
+var
+  Lib: HMODULE;
+begin
+  Result := nil;
+{$IFDEF MSWINDOWS}
+  Lib := GetModuleHandle(PChar(LayaLib));
+  if Lib = 0 then
+{$ENDIF}
+    Lib := LoadLibrary(PChar(LayaLib));
+  if Lib <> 0 then
+    Result := GetProcAddress(Lib, PChar('laya_set_codec'));
+end;
+{$ENDIF}
+
+function LayaCodecSupported: Boolean;
+begin
+  Result := FindSetCodec <> nil;
+end;
+
+procedure LayaSetCodec(Fn: TLayaCodecProc; User: Pointer);
+var
+  Address: Pointer;
+begin
+  Address := FindSetCodec;
+  if Address = nil then
+    raise ELaya.Create('This Laya library has no codec support (laya_set_codec is missing: it is older than 1.0.15).');
+  TLayaSetCodec(Address)(Fn, User);
 end;
 
 function LayaQuote(const S: string): string;
@@ -140,7 +307,8 @@ begin
       #12: SB := SB + '\f';
       #13: SB := SB + '\r';
     else
-      if Ord(C) < 32 then SB := SB + '\u' + IntToHex(Ord(C), 4)
+      (* lowercase hex, the same spelling the library writes, so quoted text can be compared *)
+      if Ord(C) < 32 then SB := SB + '\u' + LowerCase(IntToHex(Ord(C), 4))
       else SB := SB + C;
     end;
   end;
@@ -171,12 +339,61 @@ end;
 (* TLayaAgent *)
 
 constructor TLayaAgent.Create(const ModelDir, OptionsJson: string);
+begin
+  Create(ModelDir, OptionsJson, nil);
+end;
+
+constructor TLayaAgent.Create(const ModelDir, OptionsJson: string;
+  AOnLibraryLoaded: TLayaLibraryLoadedProc);
 var
   Dir, Opts: UTF8String;
+{$IFDEF LAYA_DELAYED}
+  LayaModule: HMODULE;
+  LoadedHere: Boolean;
+{$ENDIF}
 begin
   inherited Create;
+  FHandle := nil;
+
+{$IFDEF LAYA_DELAYED}
+  (* With delayed imports, merely entering this unit does not load laya.dll.
+     Force it into the process first so AOnLibraryLoaded can refresh/patch the
+     IATs of laya.dll and the dependencies Windows loaded with it. *)
+  LayaModule := GetModuleHandle(PChar(LayaLib));
+  LoadedHere := LayaModule = 0;
+  if LoadedHere then
+  begin
+    LayaModule := LoadLibrary(PChar(LayaLib));
+    if LayaModule = 0 then
+      raise ELaya.CreateFmt(
+        'Cannot load %s (Windows error %d: %s). Put %s and the DLLs it depends on next to the program.',
+        [LayaLib, GetLastError, Trim(SysErrorMessage(GetLastError)), LayaLib]);
+  end;
+
+  try
+    if Assigned(AOnLibraryLoaded) then
+      AOnLibraryLoaded;
+
+    (* This is intentionally the first delayed-import call. Delphi now binds
+       its delayed import while our explicit LoadLibrary reference is alive. *)
+    if laya_api_version <> LAYA_C_API_VERSION then
+      raise ELaya.CreateFmt('laya.dll API version %d, expected %d',
+        [laya_api_version, LAYA_C_API_VERSION]);
+  finally
+    (* Once laya_api_version has resolved, Delphi's delay loader owns its normal
+       module reference. Drop only the extra reference acquired above. *)
+    if LoadedHere and (LayaModule <> 0) then
+      FreeLibrary(LayaModule);
+  end;
+{$ELSE}
+  if Assigned(AOnLibraryLoaded) then
+    AOnLibraryLoaded;
+
   if laya_api_version <> LAYA_C_API_VERSION then
-    raise ELaya.CreateFmt('laya.dll API version %d, expected %d', [laya_api_version, LAYA_C_API_VERSION]);
+    raise ELaya.CreateFmt('laya.dll API version %d, expected %d',
+      [laya_api_version, LAYA_C_API_VERSION]);
+{$ENDIF}
+
   Dir := UTF8Encode(ModelDir);
   Opts := UTF8Encode(OptionsJson);
   FHandle := laya_create(PAnsiChar(Dir), PAnsiChar(Opts));
@@ -186,7 +403,9 @@ end;
 
 destructor TLayaAgent.Destroy;
 begin
-  laya_destroy(FHandle);
+  (* Destroy also runs when Create raised. If that was because the library could not be loaded,
+     calling into it here would raise a second time, so only call it with a real handle. *)
+  if FHandle <> nil then laya_destroy(FHandle);
   FHandle := nil;
   inherited;
 end;
@@ -242,10 +461,38 @@ begin
   Result := Predict(Question(State, Id, 'choice', Instructions, JsonArray(Options)));
 end;
 
+function TLayaAgent.AskChoiceB(const State, Instructions, DefaultOption: string;
+  const Options: array of string; const Id: string): Boolean;
+var
+  Response: string;
+begin
+  if (Length(Options) <> 2) or (Options[0] = Options[1]) then
+    raise ELaya.Create('AskChoiceB needs exactly two different options');
+  if (DefaultOption <> Options[0]) and (DefaultOption <> Options[1]) then
+    raise ELaya.Create('AskChoiceB: DefaultOption must be one of the two options');
+  Response := AskChoice(State, Instructions, Options, Id);
+  (* The answer names the selected option: ..."answers":{"q":{...,"choice":"<option>",...}}
+     Match on the name and not on a position; the name is what the library reports. *)
+  if Pos('"choice":' + LayaQuote(Options[0]), Response) > 0 then
+    Result := True
+  else if Pos('"choice":' + LayaQuote(Options[1]), Response) > 0 then
+    Result := False
+  else
+    Result := DefaultOption = Options[0];   (* no match: fall back to the default option *)
+end;
+
 function TLayaAgent.AskScore(const State, Instructions: string; const Levels: array of string;
   const Id: string): string;
 begin
   Result := Predict(Question(State, Id, 'score', Instructions, JsonArray(Levels)));
 end;
+
+{$IFDEF LAYA_DELAYED}
+initialization
+  PrevDelayHook := SetDliFailureHook2(LayaDelayFailure);
+
+finalization
+  RemoveDelayHook;
+{$ENDIF}
 
 end.
